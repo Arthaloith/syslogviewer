@@ -1,4 +1,7 @@
-import os, sys, time
+import os
+import sys
+import time
+import json
 from threading import Lock, Thread
 from flask import Flask, render_template, jsonify, send_from_directory, request, redirect, url_for, session, flash
 from flask_socketio import SocketIO, emit, join_room, leave_room, disconnect
@@ -10,6 +13,7 @@ ALLOWED = {".log", ""}
 
 # location of .auth.env created earlier
 AUTH_ENV = Path(__file__).parent / ".auth.env"
+FOLDER_STORE = Path(__file__).parent / ".folders.json"
 
 app = Flask(__name__, static_folder="static", template_folder="templates")
 # set a strong random secret key (or read from env)
@@ -55,41 +59,39 @@ def list_log_files():
     files.sort()
     return files
 
-@app.route("/")
-@login_required
-def index():
-    return render_template("index.html")
+# ------------------------
+# Folder (virtual) helpers
+# ------------------------
+def _load_folders():
+    try:
+        if not FOLDER_STORE.exists():
+            return {}
+        with open(FOLDER_STORE, "r") as fh:
+            data = json.load(fh) or {}
+            return {k: list(v) for k, v in data.items()}
+    except Exception:
+        return {}
 
-@app.route("/login", methods=["GET", "POST"])
-def login():
-    if request.method == "POST":
-        user = request.form.get("username", "")
-        pw = request.form.get("password", "")
-        if user == AUTH_USER and check_password_hash(AUTH_PW_HASH, pw):
-            session.clear()
-            session["logged_in"] = True
-            session["user"] = user
-            next_url = request.args.get("next") or url_for("index")
-            return redirect(next_url)
-        flash("Invalid credentials", "error")
-    return render_template("login.html")
+def _save_folders(data):
+    try:
+        with open(FOLDER_STORE, "w") as fh:
+            json.dump(data, fh, indent=2)
+        return True
+    except Exception:
+        return False
 
-@app.route("/logout")
-def logout():
-    session.clear()
-    return redirect(url_for("login"))
+def _sanitize_filename(fname):
+    # only allow basename (no slashes) and allowed extension
+    if os.path.basename(fname) != fname:
+        return None
+    _, ext = os.path.splitext(fname)
+    if ext not in ALLOWED:
+        return None
+    return fname
 
-@app.route("/logs/list")
-@login_required
-def logs_list():
-    return jsonify(list_log_files())
-
-@app.route("/static/<path:filename>")
-@login_required
-def static_files(filename):
-    return send_from_directory("static", filename)
-
-# send_last_lines, tail_file_background unchanged (copy from your current working version)
+# ------------------------
+# Log tailing helpers
+# ------------------------
 def send_last_lines(filename, room, n=200):
     path = os.path.join(LOG_DIR, filename)
     try:
@@ -124,6 +126,115 @@ def tail_file_background(filename, room):
     except Exception as e:
         socketio.emit("log_error", {"file": filename, "error": str(e)}, room=room)
 
+# ------------------------
+# Flask routes
+# ------------------------
+@app.route("/")
+@login_required
+def index():
+    return render_template("index.html")
+
+@app.route("/login", methods=["GET", "POST"])
+def login():
+    if request.method == "POST":
+        user = request.form.get("username", "")
+        pw = request.form.get("password", "")
+        if user == AUTH_USER and check_password_hash(AUTH_PW_HASH, pw):
+            session.clear()
+            session["logged_in"] = True
+            session["user"] = user
+            next_url = request.args.get("next") or url_for("index")
+            return redirect(next_url)
+        flash("Invalid credentials", "error")
+    return render_template("login.html")
+
+@app.route("/logout")
+def logout():
+    session.clear()
+    return redirect(url_for("login"))
+
+# Return grouped file list (folders + unsorted)
+@app.route("/logs/list")
+@login_required
+def logs_list():
+    files = list_log_files()
+    folders = _load_folders()
+    # prune folder entries referencing missing files
+    for k in list(folders.keys()):
+        folders[k] = [f for f in folders[k] if f in files]
+    # create response: {"folders": {name: [files]}, "unsorted": [files not in any folder]}
+    assigned = set()
+    for v in folders.values():
+        assigned.update(v)
+    unsorted = [f for f in files if f not in assigned]
+    return jsonify({"folders": folders, "unsorted": unsorted})
+
+@app.route("/static/<path:filename>")
+@login_required
+def static_files(filename):
+    return send_from_directory("static", filename)
+
+# Folder management APIs
+@app.route("/folders/list")
+@login_required
+def folders_list():
+    folders = _load_folders()
+    return jsonify(folders)
+
+@app.route("/folders/create", methods=["POST"])
+@login_required
+def folders_create():
+    name = (request.json or {}).get("name", "")
+    if not name or "/" in name or "\\" in name:
+        return jsonify({"error": "invalid folder name"}), 400
+    folders = _load_folders()
+    if name in folders:
+        return jsonify({"error": "exists"}), 400
+    folders[name] = []
+    _save_folders(folders)
+    return jsonify({"ok": True})
+
+@app.route("/folders/delete", methods=["POST"])
+@login_required
+def folders_delete():
+    name = (request.json or {}).get("name", "")
+    folders = _load_folders()
+    if name not in folders:
+        return jsonify({"error": "not found"}), 404
+    folders.pop(name, None)
+    _save_folders(folders)
+    return jsonify({"ok": True})
+
+@app.route("/folders/move", methods=["POST"])
+@login_required
+def folders_move():
+    # move file -> target_folder (or "" for Unsorted)
+    body = request.json or {}
+    file = body.get("file", "")
+    target = body.get("target", "")
+    file = _sanitize_filename(file)
+    if not file:
+        return jsonify({"error": "invalid file"}), 400
+    # ensure file exists on disk and allowed
+    path = os.path.join(LOG_DIR, file)
+    if not os.path.isfile(path):
+        return jsonify({"error": "file not found"}), 404
+    folders = _load_folders()
+    # remove file from any folder
+    for k in list(folders.keys()):
+        if file in folders[k]:
+            folders[k].remove(file)
+    if target:
+        if target not in folders:
+            return jsonify({"error": "target folder not found"}), 404
+        if file not in folders[target]:
+            folders[target].append(file)
+    _save_folders(folders)
+    return jsonify({"ok": True})
+
+# ------------------------
+# Socket.IO handlers
+# ------------------------
 @socketio.on("connect")
 def ws_connect():
     # only allow socket if session shows logged_in
