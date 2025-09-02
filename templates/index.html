@@ -5,57 +5,34 @@
     <title>RPI Syslog Viewer</title>
     <style>
       body { font-family: Arial, sans-serif; margin: 0; display: flex; height: 100vh; }
-      #sidebar { width: 320px; border-right: 1px solid #ddd; padding: 10px; box-sizing: border-box; overflow-y: auto; }
+      #sidebar { width: 260px; border-right: 1px solid #ddd; padding: 10px; box-sizing: border-box; overflow-y: auto; }
       #main { flex: 1; display: flex; flex-direction: column; }
       .tab { padding: 8px; cursor: pointer; border-radius: 4px; margin-bottom: 4px; background: #f5f5f5; }
       .tab.active { background: #e0f0ff; font-weight: bold; }
       #log { flex: 1; background: #111; color: #eee; padding: 10px; font-family: monospace; overflow: auto; white-space: pre-wrap; }
-      #controls { padding: 8px; border-bottom: 1px solid #ddd; display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+      #controls { padding: 8px; border-bottom: 1px solid #ddd; display: flex; gap: 8px; align-items: center; }
       button { padding: 6px 10px; }
-      input, select { padding: 6px; }
-      .folder-header { display:flex; align-items:center; gap:8px; }
-      .folder-box { margin-top:8px; border-top:1px dashed #eee; padding-top:6px; }
     </style>
   </head>
   <body>
     <div id="sidebar">
-      <div style="display:flex;gap:8px;margin-bottom:8px">
-        <input id="newFolder" placeholder="New folder name" style="flex:1"/>
-        <button id="createFolder">Create</button>
-      </div>
-      <div id="foldersRoot">
-        <h3>Log files</h3>
-        <div id="folders"></div>
-      </div>
+      <h3>Log files</h3>
+      <div id="files"></div>
     </div>
-
     <div id="main">
       <div id="controls">
         <div id="current">Not connected</div>
         <button id="clear">Clear</button>
-
-        <label style="margin-left:auto">Move to:
-          <select id="moveSelect" style="margin-left:6px"></select>
-        </label>
-        <button id="moveBtn">Move</button>
       </div>
       <div id="log"></div>
     </div>
 
     <script src="/static/socket.io.min.js"></script>
     <script>
-      const foldersEl = document.getElementById("folders");
-      const newFolderEl = document.getElementById("newFolder");
-      const createFolderBtn = document.getElementById("createFolder");
-      const moveSelect = document.getElementById("moveSelect");
-      const moveBtn = document.getElementById("moveBtn");
-
+      const filesEl = document.getElementById("files");
       const logEl = document.getElementById("log");
       const currentEl = document.getElementById("current");
       let currentFile = null;
-      let currentFolder = null;
-      let currentFilePrev = null;
-
       // connect to socket.io (same host)
       const socket = io();
 
@@ -64,7 +41,6 @@
       });
 
       socket.on("log_line", (data) => {
-        // server emits lines using filename only; ignore if not current file
         if (data.file !== currentFile) return;
         appendLine(data.line);
       });
@@ -74,8 +50,6 @@
         appendLine("[ERROR] " + data.error + "\n");
       });
 
-      socket.on("connected", () => console.log("ws connected"));
-
       function appendLine(text) {
         const atBottom = (Math.abs((logEl.scrollHeight - logEl.clientHeight) - logEl.scrollTop) < 20);
         logEl.textContent += text;
@@ -84,127 +58,38 @@
         }
       }
 
+      function setActive(file) {
+        if (currentFile === file) return;
+        if (currentFile) {
+          socket.emit("leave", {file: currentFile});
+        }
+        currentFile = file;
+        currentEl.textContent = file;
+        logEl.textContent = "";
+        socket.emit("join", {file: file});
+        // highlight
+        document.querySelectorAll(".tab").forEach(t => t.classList.toggle("active", t.dataset.file === file));
+      }
+
+      function loadFiles() {
+        fetch("/logs/list").then(r => r.json()).then(list => {
+          filesEl.innerHTML = "";
+          list.forEach(f => {
+            const d = document.createElement("div");
+            d.className = "tab";
+            d.textContent = f;
+            d.dataset.file = f;
+            d.onclick = () => setActive(f);
+            filesEl.appendChild(d);
+          });
+        });
+      }
+
       document.getElementById("clear").onclick = () => { logEl.textContent = ""; };
 
-      // --- Folder API client functions ---
-      function loadFolders() {
-        fetch("/folders/list").then(r => r.json()).then(data => {
-          if (data.error) { console.error(data.error); return; }
-          foldersEl.innerHTML = "";
-
-          // root files
-          if (data.root_files && data.root_files.length) {
-            const rootDiv = document.createElement("div");
-            const rootHeader = document.createElement("div");
-            rootHeader.innerHTML = "<strong>Root</strong>";
-            rootDiv.appendChild(rootHeader);
-            data.root_files.forEach(f => {
-              const d = document.createElement("div");
-              d.className = "tab";
-              d.textContent = f;
-              d.dataset.file = f;
-              d.onclick = () => setActiveInFolder("", f);
-              rootDiv.appendChild(d);
-            });
-            foldersEl.appendChild(rootDiv);
-          }
-
-          (data.folders || []).forEach(folder => {
-            const box = document.createElement("div");
-            box.className = "folder-box";
-            const header = document.createElement("div");
-            header.className = "folder-header";
-            header.innerHTML = `<strong>${folder.name}</strong>`;
-            const delBtn = document.createElement("button");
-            delBtn.textContent = "Delete";
-            delBtn.style.marginLeft = "8px";
-            delBtn.onclick = () => {
-              if (!confirm("Delete folder " + folder.name + " (must be empty)?")) return;
-              fetch("/folders/delete", {method:"POST", body: new URLSearchParams({name: folder.name})})
-                .then(r => r.json()).then(r => { if (r.ok) loadFolders(); else alert(r.error || "delete failed"); });
-            };
-            header.appendChild(delBtn);
-            box.appendChild(header);
-
-            folder.files.forEach(f => {
-              const d = document.createElement("div");
-              d.className = "tab";
-              d.textContent = f;
-              d.dataset.file = f;
-              d.dataset.folder = folder.name;
-              d.onclick = () => setActiveInFolder(folder.name, f);
-              box.appendChild(d);
-            });
-            foldersEl.appendChild(box);
-          });
-
-        }).catch(err => console.error("folders load failed", err));
-      }
-
-      createFolderBtn.onclick = () => {
-        const name = newFolderEl.value.trim();
-        if (!name) return;
-        fetch("/folders/create", {method:"POST", body: new URLSearchParams({name})})
-          .then(r => r.json()).then(r => {
-            if (r.ok) { newFolderEl.value=""; loadFolders(); refreshMoveOptions(); }
-            else alert(r.error || "create failed");
-        });
-      };
-
-      function refreshMoveOptions() {
-        fetch("/folders/list").then(r => r.json()).then(data => {
-          moveSelect.innerHTML = "";
-          const optRoot = document.createElement("option");
-          optRoot.value = "";
-          optRoot.textContent = "Root";
-          moveSelect.appendChild(optRoot);
-          (data.folders||[]).forEach(f => {
-            const o = document.createElement("option");
-            o.value = f.name;
-            o.textContent = f.name;
-            moveSelect.appendChild(o);
-          });
-        }).catch(err => console.error("move options failed", err));
-      }
-
-      moveBtn.onclick = () => {
-        if (!currentFile) { alert("No file selected"); return; }
-        const folder = moveSelect.value;
-        fetch("/folders/move", {method:"POST", body: new URLSearchParams({file: currentFile, folder})})
-          .then(r => r.json()).then(res => {
-            if (res.ok) { loadFolders(); refreshMoveOptions(); }
-            else alert(res.error || "move failed");
-        });
-      };
-
-      // --- Selecting and tailing files ---
-      function setActiveInFolder(folder, file) {
-        if (currentFile === file && currentFolder === folder) return;
-        // leave previous
-        if (currentFile) { socket.emit("leave", {file: currentFile}); }
-        currentFile = file;
-        currentFolder = folder;
-        currentEl.textContent = folder ? (folder + "/" + file) : file;
-        logEl.textContent = "";
-        // join by filename - server finds file by name across folders
-        socket.emit("join", {file: file});
-        // mark active visually
-        document.querySelectorAll(".tab").forEach(t => {
-          const sameFile = t.dataset.file === file;
-          const sameFolder = (t.dataset.folder || "") === folder;
-          t.classList.toggle("active", sameFile && sameFolder);
-        });
-      }
-
-      // Initial load
-      loadFolders();
-      refreshMoveOptions();
-      // periodic refresh
-      setInterval(loadFolders, 15000);
-      setInterval(refreshMoveOptions, 30000);
-
-      // socket.io client lib fallback loader
+      // load socket.io client lib fallback
       (function ensureSocketIO(){
+        // If socket.io not loaded, load from CDN
         if (typeof io === "undefined") {
           const s = document.createElement("script");
           s.src = "https://cdn.jsdelivr.net/npm/socket.io-client@4/dist/socket.io.min.js";
@@ -212,6 +97,10 @@
           document.head.appendChild(s);
         }
       })();
+
+      loadFiles();
+      // refresh file list occasionally
+      setInterval(loadFiles, 15000);
     </script>
   </body>
 </html>
