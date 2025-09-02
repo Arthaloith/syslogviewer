@@ -20,7 +20,7 @@ app = Flask(__name__, static_folder="static", template_folder="templates")
 app.config["SECRET_KEY"] = os.environ.get("FLASK_SECRET", "replace-with-a-random-secret-please-change")
 socketio = SocketIO(app, async_mode="eventlet")
 thread_lock = Lock()
-tail_threads = {}
+tail_threads = {}  # { room: {"thread": Thread, "stop": bool, "file": str} }
 
 # load credentials
 def load_auth():
@@ -116,8 +116,10 @@ def tail_file_background(filename, room):
         with open(path, "r", errors="replace") as fh:
             fh.seek(0, os.SEEK_END)
             while True:
-                if room not in tail_threads or tail_threads[room].get("stop"):
-                    break
+                with thread_lock:
+                    info = tail_threads.get(room)
+                    if not info or info.get("stop"):
+                        break
                 line = fh.readline()
                 if not line:
                     time.sleep(0.2)
@@ -125,6 +127,11 @@ def tail_file_background(filename, room):
                 socketio.emit("log_line", {"file": filename, "line": line}, room=room)
     except Exception as e:
         socketio.emit("log_error", {"file": filename, "error": str(e)}, room=room)
+    finally:
+        # cleanup after stop
+        with thread_lock:
+            if room in tail_threads:
+                tail_threads.pop(room, None)
 
 # ------------------------
 # Flask routes
@@ -253,13 +260,17 @@ def on_join(data):
     join_room(room)
     emit("joined", {"file": filename})
     send_last_lines(filename, room, n=200)
+
     with thread_lock:
-        info = tail_threads.get(room)
-        if not info:
-            tail_threads[room] = {"thread": None, "stop": False}
-            thread = Thread(target=tail_file_background, args=(filename, room), daemon=True)
-            tail_threads[room]["thread"] = thread
-            thread.start()
+        # stop any existing thread for this room
+        old = tail_threads.get(room)
+        if old:
+            old["stop"] = True
+        # create a fresh one
+        tail_threads[room] = {"thread": None, "stop": False, "file": filename}
+        thread = Thread(target=tail_file_background, args=(filename, room), daemon=True)
+        tail_threads[room]["thread"] = thread
+        thread.start()
 
 @socketio.on("leave")
 def on_leave(data):
@@ -272,7 +283,6 @@ def on_leave(data):
         info = tail_threads.get(room)
         if info:
             info["stop"] = True
-            tail_threads.pop(room, None)
 
 @socketio.on("disconnect")
 def on_disconnect():
