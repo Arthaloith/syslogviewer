@@ -40,7 +40,7 @@
       .menu-panel button:hover{background:#f2f7ff}
       .feedback{font-size:13px;padding:6px 10px;border-radius:8px}
       .success{background:#eef9f1;color:#05632a;border:1px solid #d4f5de}
-      .error{background:#fff5f5;color:#990f0f;border:1px solid #ffdede}
+      .error{background:#fff5f5;color:#990f0f;border:1px solid #ffdede\}
       .delete-btn{background: #dc2626;color: #fff;border: none;padding: 6px 12px;font-size: 13px;border-radius: 6px;cursor: pointer;box-shadow: 0 1px 2px rgba(11,15,25,0.06);transition: background 0.2s ease-in-out;}
       .delete-btn:hover{background: #b91c1c}
     </style>
@@ -107,16 +107,6 @@
         currentFile = file;
         currentEl.textContent = file;
         logEl.textContent = "";
-
-        // ✅ fetch full file contents
-        fetch(`/logs/content/${encodeURIComponent(file)}`)
-          .then(r => r.text())
-          .then(text => {
-            logEl.textContent = text;
-            logEl.scrollTop = logEl.scrollHeight;
-          });
-
-        // join socket room for live updates
         socket.emit("join", {file});
         document.querySelectorAll(".file-item").forEach(el => el.classList.toggle("active", el.dataset.file === file));
       }

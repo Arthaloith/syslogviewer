@@ -262,6 +262,17 @@ def folders_move():
     _save_folders(folders)
     return jsonify({"ok": True})
 
+@app.route("/logs/content/<path:filename>")
+def get_log_content(filename):
+    try:
+        filepath = os.path.join(LOG_DIR, filename)
+        if not os.path.isfile(filepath):
+            return "File not found", 404
+        with open(filepath, "r", encoding="utf-8", errors="ignore") as f:
+            return f.read(), 200, {"Content-Type": "text/plain; charset=utf-8"}
+    except Exception as e:
+        return f"Error reading file: {e}", 500
+
 # ------------------------
 # Socket.IO handlers
 # ------------------------
