@@ -90,16 +90,33 @@ def _sanitize_filename(fname):
     return fname
 
 # ------------------------
-# Log tailing helpers
+# Log sending / tailing helpers
 # ------------------------
 def send_last_lines(filename, room, n=200):
+    """
+    Send last `n` lines to the room. If n is None, send the entire file.
+    Emits 'log_line' events (same format your frontend already listens to).
+    """
     path = os.path.join(LOG_DIR, filename)
     try:
+        if n is None:
+            # Send entire file from start
+            with open(path, "r", errors="replace") as fh:
+                for line in fh:
+                    # ensure newline at end
+                    if not line.endswith("\n"):
+                        socketio.emit("log_line", {"file": filename, "line": line + "\n"}, room=room)
+                    else:
+                        socketio.emit("log_line", {"file": filename, "line": line}, room=room)
+            return
+
+        # Existing "last N lines" logic (keeps behaviour if you prefer to use it)
         with open(path, "r", errors="replace") as fh:
             fh.seek(0, os.SEEK_END)
             size = fh.tell()
             block = 4096
             data = ""
+            # read backwards in blocks until we have more than n lines or file start
             while len(data.splitlines()) <= n and size > 0:
                 size = max(0, size - block)
                 fh.seek(size)
@@ -111,9 +128,15 @@ def send_last_lines(filename, room, n=200):
         socketio.emit("log_error", {"file": filename, "error": str(e)}, room=room)
 
 def tail_file_background(filename, room):
+    """
+    Background thread: tail the file for new lines and emit them.
+    This thread checks tail_threads[room]['stop'] under thread_lock to know when to exit.
+    It seeks to EOF on open to avoid re-sending existing content (we already sent entire file on join).
+    """
     path = os.path.join(LOG_DIR, filename)
     try:
         with open(path, "r", errors="replace") as fh:
+            # Seek to end to only capture new lines after join
             fh.seek(0, os.SEEK_END)
             while True:
                 with thread_lock:
@@ -128,7 +151,7 @@ def tail_file_background(filename, room):
     except Exception as e:
         socketio.emit("log_error", {"file": filename, "error": str(e)}, room=room)
     finally:
-        # cleanup after stop
+        # cleanup mapping when thread exits
         with thread_lock:
             if room in tail_threads:
                 tail_threads.pop(room, None)
@@ -259,14 +282,17 @@ def on_join(data):
     room = filename
     join_room(room)
     emit("joined", {"file": filename})
-    send_last_lines(filename, room, n=200)
 
+    # Send the full content first (n=None => whole file)
+    send_last_lines(filename, room, n=None)
+
+    # Then start (or restart) tail thread so client gets live updates after the full file
     with thread_lock:
-        # stop any existing thread for this room
         old = tail_threads.get(room)
         if old:
+            # signal old thread to stop. it will cleanup itself on exit.
             old["stop"] = True
-        # create a fresh one
+        # create a fresh one for this room
         tail_threads[room] = {"thread": None, "stop": False, "file": filename}
         thread = Thread(target=tail_file_background, args=(filename, room), daemon=True)
         tail_threads[room]["thread"] = thread
@@ -283,9 +309,11 @@ def on_leave(data):
         info = tail_threads.get(room)
         if info:
             info["stop"] = True
+            # actual removal from dict will happen in thread's finally block
 
 @socketio.on("disconnect")
 def on_disconnect():
+    # nothing special here; threads clean themselves when stop is True
     pass
 
 if __name__ == "__main__":
