@@ -1,0 +1,17 @@
+<!doctype html>
+<html>
+  <head><meta charset="utf-8"/><title>Login</title></head>
+  <body style="font-family:Arial,sans-serif;display:flex;align-items:center;justify-content:center;height:100vh">
+    <form method="post" style="width:320px;padding:20px;border:1px solid #ddd;border-radius:6px">
+      <h3>Login</h3>
+      {% with messages = get_flashed_messages(category_filter=["error"]) %}
+        {% if messages %}
+          <div style="color:#900">{{ messages[0] }}</div>
+        {% endif %}
+      {% endwith %}
+      <label>Username<input name="username" autofocus required style="width:100%"/></label><br/><br/>
+      <label>Password<input name="password" type="password" required style="width:100%"/></label><br/><br/>
+      <button type="submit">Sign in</button>
+    </form>
+  </body>
+</html>

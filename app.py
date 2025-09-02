@@ -1,0 +1,286 @@
+import os, sys, time
+from threading import Lock, Thread
+from flask import Flask, render_template, abort, jsonify, send_from_directory, request, redirect, url_for, session, flash
+from flask_socketio import SocketIO, emit, join_room, leave_room, disconnect
+from werkzeug.security import check_password_hash
+from werkzeug.utils import secure_filename
+from pathlib import Path
+
+LOG_DIR = "/var/log"
+ALLOWED = {".log", ""}
+
+# location of .auth.env created earlier
+AUTH_ENV = Path(__file__).parent / ".auth.env"
+
+app = Flask(__name__, static_folder="static", template_folder="templates")
+# set a strong random secret key (or read from env)
+app.config["SECRET_KEY"] = os.environ.get("FLASK_SECRET", "replace-with-a-random-secret-please-change")
+socketio = SocketIO(app, async_mode="eventlet")
+thread_lock = Lock()
+tail_threads = {}
+
+# load credentials
+def load_auth():
+    if not AUTH_ENV.exists():
+        raise RuntimeError("Auth file missing: " + str(AUTH_ENV))
+    data = {}
+    with open(AUTH_ENV, "r") as f:
+        for line in f:
+            if "=" in line:
+                k, v = line.strip().split("=", 1)
+                data[k] = v
+    return data.get("USERNAME"), data.get("PASSWORD_HASH")
+
+AUTH_USER, AUTH_PW_HASH = load_auth()
+
+def login_required(fn):
+    from functools import wraps
+    @wraps(fn)
+    def wrapper(*a, **kw):
+        if session.get("logged_in") and session.get("user") == AUTH_USER:
+            return fn(*a, **kw)
+        return redirect(url_for("login", next=request.path))
+    return wrapper
+
+def list_log_files():
+    files = []
+    try:
+        for entry in os.listdir(LOG_DIR):
+            path = os.path.join(LOG_DIR, entry)
+            if os.path.isfile(path):
+                _, ext = os.path.splitext(entry)
+                if ext in ALLOWED:
+                    files.append(entry)
+    except Exception as e:
+        print("Error listing logs:", e, file=sys.stderr)
+    files.sort()
+    return files
+
+# Helper: ensure path stays inside LOG_DIR
+def safe_path(*parts):
+    path = os.path.normpath(os.path.join(LOG_DIR, *parts))
+    if not path.startswith(os.path.normpath(LOG_DIR) + os.sep) and path != os.path.normpath(LOG_DIR):
+        raise ValueError("Invalid path")
+    return path
+
+@app.route("/")
+@login_required
+def index():
+    return render_template("index.html")
+
+@app.route("/folders/list")
+@login_required
+def folders_list():
+    # return list of folders (relative names) and files not in folders
+    items = {"folders": [], "root_files": []}
+    try:
+        for entry in sorted(os.listdir(LOG_DIR)):
+            p = os.path.join(LOG_DIR, entry)
+            if os.path.isdir(p):
+                # only include non-hidden dirs
+                if not entry.startswith("."):
+                    # list files inside folder
+                    files = [f for f in sorted(os.listdir(p))
+                             if os.path.isfile(os.path.join(p, f))]
+                    items["folders"].append({"name": entry, "files": files})
+            elif os.path.isfile(p):
+                items["root_files"].append(entry)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+    return jsonify(items)
+
+@app.route("/folders/create", methods=["POST"])
+@login_required
+def folder_create():
+    name = request.form.get("name", "")
+    if not name:
+        return jsonify({"error": "missing name"}), 400
+    name = secure_filename(name)
+    if name in ("", ".", ".."):
+        return jsonify({"error": "invalid name"}), 400
+    path = safe_path(name)
+    try:
+        os.makedirs(path, exist_ok=False)
+    except FileExistsError:
+        return jsonify({"error": "folder exists"}), 409
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+    return jsonify({"ok": True, "name": name})
+
+@app.route("/folders/delete", methods=["POST"])
+@login_required
+def folder_delete():
+    name = request.form.get("name", "")
+    if not name:
+        return jsonify({"error": "missing name"}), 400
+    path = safe_path(name)
+    # only allow deleting empty folders for safety
+    if not os.path.isdir(path):
+        return jsonify({"error": "not a folder"}), 400
+    try:
+        if os.listdir(path):
+            return jsonify({"error": "folder not empty"}), 409
+        os.rmdir(path)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+    return jsonify({"ok": True})
+
+@app.route("/folders/move", methods=["POST"])
+@login_required
+def folder_move():
+    # move a file into a folder (or out to root)
+    filename = request.form.get("file", "")
+    dest_folder = request.form.get("folder", "")  # empty for root
+    if not filename:
+        return jsonify({"error": "missing file"}), 400
+    filename = secure_filename(filename)
+    # source may be in root or inside a folder; search for it
+    src = None
+    # check root
+    root_candidate = safe_path(filename)
+    if os.path.isfile(root_candidate):
+        src = root_candidate
+    else:
+        # search folders
+        for entry in os.listdir(LOG_DIR):
+            dpath = os.path.join(LOG_DIR, entry)
+            if os.path.isdir(dpath):
+                cand = os.path.join(dpath, filename)
+                if os.path.isfile(cand):
+                    src = cand
+                    break
+    if not src:
+        return jsonify({"error": "file not found"}), 404
+
+    # destination path
+    if dest_folder:
+        dest_folder = secure_filename(dest_folder)
+        dest_dir = safe_path(dest_folder)
+        if not os.path.isdir(dest_dir):
+            return jsonify({"error": "dest folder not found"}), 404
+    else:
+        dest_dir = safe_path("")  # root
+
+    dest = os.path.join(dest_dir, filename)
+    # prevent overwriting existing file
+    if os.path.exists(dest):
+        return jsonify({"error": "destination file exists"}), 409
+    try:
+        os.rename(src, dest)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+    return jsonify({"ok": True, "file": filename, "folder": dest_folder})
+
+
+@app.route("/login", methods=["GET", "POST"])
+def login():
+    if request.method == "POST":
+        user = request.form.get("username", "")
+        pw = request.form.get("password", "")
+        if user == AUTH_USER and check_password_hash(AUTH_PW_HASH, pw):
+            session.clear()
+            session["logged_in"] = True
+            session["user"] = user
+            next_url = request.args.get("next") or url_for("index")
+            return redirect(next_url)
+        flash("Invalid credentials", "error")
+    return render_template("login.html")
+
+@app.route("/logout")
+def logout():
+    session.clear()
+    return redirect(url_for("login"))
+
+@app.route("/logs/list")
+@login_required
+def logs_list():
+    return jsonify(list_log_files())
+
+@app.route("/static/<path:filename>")
+@login_required
+def static_files(filename):
+    return send_from_directory("static", filename)
+
+# send_last_lines, tail_file_background unchanged (copy from your current working version)
+def send_last_lines(filename, room, n=200):
+    path = os.path.join(LOG_DIR, filename)
+    try:
+        with open(path, "r", errors="replace") as fh:
+            fh.seek(0, os.SEEK_END)
+            size = fh.tell()
+            block = 4096
+            data = ""
+            while len(data.splitlines()) <= n and size > 0:
+                size = max(0, size - block)
+                fh.seek(size)
+                data = fh.read()
+            lines = data.splitlines()[-n:]
+            for line in lines:
+                socketio.emit("log_line", {"file": filename, "line": line + "\n"}, room=room)
+    except Exception as e:
+        socketio.emit("log_error", {"file": filename, "error": str(e)}, room=room)
+
+def tail_file_background(filename, room):
+    path = os.path.join(LOG_DIR, filename)
+    try:
+        with open(path, "r", errors="replace") as fh:
+            fh.seek(0, os.SEEK_END)
+            while True:
+                if room not in tail_threads or tail_threads[room].get("stop"):
+                    break
+                line = fh.readline()
+                if not line:
+                    time.sleep(0.2)
+                    continue
+                socketio.emit("log_line", {"file": filename, "line": line}, room=room)
+    except Exception as e:
+        socketio.emit("log_error", {"file": filename, "error": str(e)}, room=room)
+
+@socketio.on("connect")
+def ws_connect():
+    # only allow socket if session shows logged_in
+    if not session.get("logged_in") or session.get("user") != AUTH_USER:
+        # disconnect unauthenticated sockets
+        disconnect()
+        return
+    emit("connected", {"msg": "connected"})
+
+@socketio.on("join")
+def on_join(data):
+    filename = data.get("file")
+    if not filename:
+        return
+    room = filename
+    join_room(room)
+    emit("joined", {"file": filename})
+    send_last_lines(filename, room, n=200)
+    with thread_lock:
+        info = tail_threads.get(room)
+        if not info:
+            tail_threads[room] = {"thread": None, "stop": False}
+            thread = Thread(target=tail_file_background, args=(filename, room), daemon=True)
+            tail_threads[room]["thread"] = thread
+            thread.start()
+
+@socketio.on("leave")
+def on_leave(data):
+    filename = data.get("file")
+    if not filename:
+        return
+    room = filename
+    leave_room(room)
+    with thread_lock:
+        info = tail_threads.get(room)
+        if info:
+            info["stop"] = True
+            tail_threads.pop(room, None)
+
+@socketio.on("disconnect")
+def on_disconnect():
+    pass
+
+if __name__ == "__main__":
+    host = "0.0.0.0"
+    port = 5065
+    print(f"Serving on http://{host}:{port}")
+    socketio.run(app, host=host, port=port)

@@ -1,0 +1,4 @@
+Flask>=2.2,<3
+Flask-SocketIO>=5.5,<7
+python-socketio>=5.12
+eventlet>=0.33,<1
