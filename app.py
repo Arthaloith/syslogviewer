@@ -3,7 +3,7 @@ import sys
 import time
 import json
 from threading import Lock, Thread
-from flask import Flask, render_template, jsonify, send_from_directory, request, redirect, url_for, session, flash
+from flask import Flask, render_template, jsonify, send_from_directory, request, redirect, url_for, session, flash, send_file
 from flask_socketio import SocketIO, emit, join_room, leave_room, disconnect
 from werkzeug.security import check_password_hash
 from pathlib import Path
@@ -103,20 +103,17 @@ def send_last_lines(filename, room, n=200):
             # Send entire file from start
             with open(path, "r", errors="replace") as fh:
                 for line in fh:
-                    # ensure newline at end
                     if not line.endswith("\n"):
                         socketio.emit("log_line", {"file": filename, "line": line + "\n"}, room=room)
                     else:
                         socketio.emit("log_line", {"file": filename, "line": line}, room=room)
             return
 
-        # Existing "last N lines" logic (keeps behaviour if you prefer to use it)
         with open(path, "r", errors="replace") as fh:
             fh.seek(0, os.SEEK_END)
             size = fh.tell()
             block = 4096
             data = ""
-            # read backwards in blocks until we have more than n lines or file start
             while len(data.splitlines()) <= n and size > 0:
                 size = max(0, size - block)
                 fh.seek(size)
@@ -128,15 +125,9 @@ def send_last_lines(filename, room, n=200):
         socketio.emit("log_error", {"file": filename, "error": str(e)}, room=room)
 
 def tail_file_background(filename, room):
-    """
-    Background thread: tail the file for new lines and emit them.
-    This thread checks tail_threads[room]['stop'] under thread_lock to know when to exit.
-    It seeks to EOF on open to avoid re-sending existing content (we already sent entire file on join).
-    """
     path = os.path.join(LOG_DIR, filename)
     try:
         with open(path, "r", errors="replace") as fh:
-            # Seek to end to only capture new lines after join
             fh.seek(0, os.SEEK_END)
             while True:
                 with thread_lock:
@@ -151,7 +142,6 @@ def tail_file_background(filename, room):
     except Exception as e:
         socketio.emit("log_error", {"file": filename, "error": str(e)}, room=room)
     finally:
-        # cleanup mapping when thread exits
         with thread_lock:
             if room in tail_threads:
                 tail_threads.pop(room, None)
@@ -183,16 +173,13 @@ def logout():
     session.clear()
     return redirect(url_for("login"))
 
-# Return grouped file list (folders + unsorted)
 @app.route("/logs/list")
 @login_required
 def logs_list():
     files = list_log_files()
     folders = _load_folders()
-    # prune folder entries referencing missing files
     for k in list(folders.keys()):
         folders[k] = [f for f in folders[k] if f in files]
-    # create response: {"folders": {name: [files]}, "unsorted": [files not in any folder]}
     assigned = set()
     for v in folders.values():
         assigned.update(v)
@@ -203,6 +190,18 @@ def logs_list():
 @login_required
 def static_files(filename):
     return send_from_directory("static", filename)
+
+# 🔽 Download log file
+@app.route("/logs/download/<path:filename>")
+@login_required
+def download_log(filename):
+    try:
+        filepath = os.path.join(LOG_DIR, filename)
+        if not os.path.isfile(filepath):
+            return "File not found", 404
+        return send_file(filepath, as_attachment=True, download_name=filename)
+    except Exception as e:
+        return f"Error downloading file: {e}", 500
 
 # Folder management APIs
 @app.route("/folders/list")
@@ -238,19 +237,16 @@ def folders_delete():
 @app.route("/folders/move", methods=["POST"])
 @login_required
 def folders_move():
-    # move file -> target_folder (or "" for Unsorted)
     body = request.json or {}
     file = body.get("file", "")
     target = body.get("target", "")
     file = _sanitize_filename(file)
     if not file:
         return jsonify({"error": "invalid file"}), 400
-    # ensure file exists on disk and allowed
     path = os.path.join(LOG_DIR, file)
     if not os.path.isfile(path):
         return jsonify({"error": "file not found"}), 404
     folders = _load_folders()
-    # remove file from any folder
     for k in list(folders.keys()):
         if file in folders[k]:
             folders[k].remove(file)
@@ -278,9 +274,7 @@ def get_log_content(filename):
 # ------------------------
 @socketio.on("connect")
 def ws_connect():
-    # only allow socket if session shows logged_in
     if not session.get("logged_in") or session.get("user") != AUTH_USER:
-        # disconnect unauthenticated sockets
         disconnect()
         return
     emit("connected", {"msg": "connected"})
@@ -294,16 +288,12 @@ def on_join(data):
     join_room(room)
     emit("joined", {"file": filename})
 
-    # Send the full content first (n=None => whole file)
     send_last_lines(filename, room, n=None)
 
-    # Then start (or restart) tail thread so client gets live updates after the full file
     with thread_lock:
         old = tail_threads.get(room)
         if old:
-            # signal old thread to stop. it will cleanup itself on exit.
             old["stop"] = True
-        # create a fresh one for this room
         tail_threads[room] = {"thread": None, "stop": False, "file": filename}
         thread = Thread(target=tail_file_background, args=(filename, room), daemon=True)
         tail_threads[room]["thread"] = thread
@@ -320,11 +310,9 @@ def on_leave(data):
         info = tail_threads.get(room)
         if info:
             info["stop"] = True
-            # actual removal from dict will happen in thread's finally block
 
 @socketio.on("disconnect")
 def on_disconnect():
-    # nothing special here; threads clean themselves when stop is True
     pass
 
 if __name__ == "__main__":

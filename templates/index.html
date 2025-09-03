@@ -78,109 +78,76 @@
 
     <script src="/static/socket.io.min.js"></script>
     <script>
-      const foldersEl = document.getElementById("folders");
-      const filesEl = document.getElementById("files");
-      const logEl = document.getElementById("log");
-      const currentEl = document.getElementById("current");
-      const input = document.getElementById("newFolderName");
-      const createIcon = document.getElementById("createIcon");
-      const feedback = document.getElementById("createFeedback");
+      const socket = io();
       let currentFile = null;
-      let menuState = {openEl: null, panel: null};
       let foldersOrder = [];
 
-      const socket = io();
+      const logEl = document.getElementById("log");
+      const currentEl = document.getElementById("current");
 
-      socket.on("connect", () => console.log("socket connected"));
-      socket.on("log_line", (data) => { if (data.file === currentFile) appendLine(data.line); });
-      socket.on("log_error", (data) => { if (data.file === currentFile) appendLine("[ERROR] " + data.error + "\n"); });
+      socket.on("log_line", (data)=>{
+        if (data.file !== currentFile) return;
+        logEl.textContent += data.line;
+        logEl.scrollTop = logEl.scrollHeight;
+      });
 
-      function appendLine(text){
-        const atBottom = (Math.abs((logEl.scrollHeight - logEl.clientHeight) - logEl.scrollTop) < 24);
-        logEl.textContent += text;
-        if (atBottom) logEl.scrollTop = logEl.scrollHeight;
-      }
+      socket.on("log_error", (data)=>{
+        if (data.file !== currentFile) return;
+        logEl.textContent += "\\n[Error: " + data.error + "]\\n";
+      });
+
+      document.getElementById("clear").onclick = ()=>{
+        logEl.textContent = "";
+      };
 
       function setActive(file){
-        if (currentFile === file) return;
-        if (currentFile) socket.emit("leave", {file: currentFile});
+        if (currentFile){
+          socket.emit("leave", {file: currentFile});
+        }
         currentFile = file;
         currentEl.textContent = file;
         logEl.textContent = "";
-
-        // ✅ fetch full file contents
-        fetch(`/logs/content/${encodeURIComponent(file)}`)
-          .then(r => r.text())
-          .then(text => {
-            logEl.textContent = text;
-            logEl.scrollTop = logEl.scrollHeight;
-          });
-
-        // join socket room for live updates
         socket.emit("join", {file});
-        document.querySelectorAll(".file-item").forEach(el => el.classList.toggle("active", el.dataset.file === file));
       }
 
-      function showFeedback(message, type){
-        feedback.innerHTML = "";
-        if(!message) return;
-        const d = document.createElement("div");
-        d.className = "feedback " + (type === "ok" ? "success" : "error");
-        d.textContent = message;
-        feedback.appendChild(d);
-        setTimeout(()=> { if (feedback.contains(d)) feedback.removeChild(d); }, 4000);
-      }
+      async function refresh(){
+        const res = await fetch("/logs/list");
+        const data = await res.json();
+        const files = data.unsorted || [];
+        const folders = data.folders || {};
+        foldersOrder = Object.keys(folders);
 
-      function closeMenu(){
-        if(menuState.panel){
-          menuState.panel.remove();
-          menuState.openEl = null;
-          menuState.panel = null;
-        }
-      }
-
-      function openMoveMenu(buttonEl, fileName, folders){
-        closeMenu();
-        const rect = buttonEl.getBoundingClientRect();
-        const panel = document.createElement("div");
-        panel.className = "menu-panel";
-        panel.style.top = (rect.bottom + window.scrollY + 6) + "px";
-        panel.style.left = (rect.left + window.scrollX) + "px";
-
-        const uns = document.createElement("button");
-        uns.textContent = "Move to Unsorted";
-        uns.onclick = (ev)=> { ev.stopPropagation(); doMove(fileName, ""); closeMenu(); };
-        panel.appendChild(uns);
-
-        panel.appendChild(document.createElement("hr"));
-
-        folders.forEach(fn=>{
-          const b = document.createElement("button");
-          b.textContent = "Move to " + fn;
-          b.onclick = (ev)=>{ ev.stopPropagation(); doMove(fileName, fn); closeMenu(); };
-          panel.appendChild(b);
+        const filesEl = document.getElementById("files");
+        filesEl.innerHTML = "";
+        files.forEach(f=>{
+          filesEl.appendChild(renderFileItem(f));
         });
+        document.getElementById("unsorted-count").textContent = files.length;
 
-        document.body.appendChild(panel);
-        menuState.openEl = buttonEl;
-        menuState.panel = panel;
-
-        setTimeout(()=> {
-          const onDoc = (ev)=>{
-            if (!panel.contains(ev.target) && ev.target !== buttonEl) {
-              closeMenu();
-              document.removeEventListener("click", onDoc);
-            }
-          };
-          document.addEventListener("click", onDoc);
-        }, 0);
-      }
-
-      function doMove(file, target){
-        fetch("/folders/move", {
-          method:"POST", headers:{"Content-Type":"application/json"},
-          body: JSON.stringify({file, target})
-        }).then(()=> loadFiles());
+        const foldersEl = document.getElementById("folders");
+        foldersEl.innerHTML = "";
+        foldersOrder.forEach(folder=>{
+          const card = document.createElement("div");
+          card.className = "folder-card";
+          const head = document.createElement("div");
+          head.className = "folder-header";
+          const title = document.createElement("div");
+          title.className = "folder-title";
+          title.textContent = folder;
+          head.appendChild(title);
+          const meta = document.createElement("div");
+          meta.className = "folder-meta";
+          meta.textContent = (folders[folder]||[]).length + " files";
+          head.appendChild(meta);
+          card.appendChild(head);
+          const list = document.createElement("div");
+          list.className = "file-list";
+          (folders[folder]||[]).forEach(f=>{
+            list.appendChild(renderFileItem(f));
+          });
+          card.appendChild(list);
+          foldersEl.appendChild(card);
+        });
       }
 
       function renderFileItem(f){
@@ -199,12 +166,25 @@
 
         const actions = document.createElement("div");
         actions.className = "file-actions";
+
+        // ⬇️ Download button
+        const dlBtn = document.createElement("a");
+        dlBtn.href = `/logs/download/${encodeURIComponent(f)}`;
+        dlBtn.textContent = "⬇️";
+        dlBtn.title = "Download log file";
+        dlBtn.style.textDecoration = "none";
+        dlBtn.style.fontSize = "16px";
+        dlBtn.style.padding = "6px";
+        dlBtn.style.borderRadius = "6px";
+        dlBtn.style.color = "#111";
+        actions.appendChild(dlBtn);
+
+        // ⋯ Move menu button
         const menuBtn = document.createElement("button");
         menuBtn.className = "menu-btn";
         menuBtn.innerHTML = "⋯";
         menuBtn.title = "Move file to folder";
         menuBtn.onclick = (ev)=>{ ev.stopPropagation(); openMoveMenu(menuBtn, f, foldersOrder); };
-
         actions.appendChild(menuBtn);
 
         row.appendChild(left);
@@ -213,111 +193,41 @@
         return row;
       }
 
-      function renderFolderCard(name, files){
-        const card = document.createElement("div");
-        card.className = "folder-card";
-
-        const header = document.createElement("div");
-        header.className = "folder-header";
-        const title = document.createElement("div");
-        title.className = "folder-title";
-        title.textContent = name;
-        const meta = document.createElement("div");
-        meta.style.display = "flex";
-        meta.style.alignItems = "center";
-        meta.style.gap = "8px";
-        const count = document.createElement("div");
-        count.className = "folder-meta";
-        count.textContent = files.length + " file" + (files.length!==1 ? "s":"");
-        const del = document.createElement("button");
-        del.className = "delete-btn";
-        del.textContent = "🗑 Delete";
-        del.onclick = (ev)=>{ ev.stopPropagation(); if(!confirm("Delete folder '"+name+"'?")) return; fetch("/folders/delete",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({name})}).then(()=> loadFiles()); };
-
-        meta.appendChild(count);
-        meta.appendChild(del);
-
-        header.appendChild(title);
-        header.appendChild(meta);
-        card.appendChild(header);
-
-        const list = document.createElement("div");
-        list.className = "file-list";
-        files.forEach(f=> list.appendChild(renderFileItem(f)));
-        card.appendChild(list);
-        return card;
-      }
-
-      function loadFiles(){
-        fetch("/logs/list").then(r=>r.json()).then(data=>{
-          const folders = data.folders || {};
-          const unsorted = data.unsorted || [];
-          foldersOrder = Object.keys(folders);
-          foldersEl.innerHTML = "";
-          foldersOrder.forEach(fn=>{
-            foldersEl.appendChild(renderFolderCard(fn, folders[fn]||[]));
-          });
-          filesEl.innerHTML = "";
-          document.getElementById("unsorted-count").textContent = "(" + unsorted.length + ")";
-          unsorted.forEach(f => filesEl.appendChild(renderFileItem(f)));
-          closeMenu();
+      function openMoveMenu(anchor, file, folders){
+        const old = document.querySelector(".menu-panel");
+        if (old) old.remove();
+        const panel = document.createElement("div");
+        panel.className = "menu-panel";
+        folders.forEach(f=>{
+          const btn = document.createElement("button");
+          btn.textContent = "Move to " + f;
+          btn.onclick = async()=>{
+            await fetch("/folders/move",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({file,target:f})});
+            panel.remove();
+            refresh();
+          };
+          panel.appendChild(btn);
         });
+        const btn = document.createElement("button");
+        btn.textContent = "Remove from folder";
+        btn.onclick = async()=>{
+          await fetch("/folders/move",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({file,target:""})});
+          panel.remove();
+          refresh();
+        };
+        panel.appendChild(btn);
+        document.body.appendChild(panel);
+        const rect = anchor.getBoundingClientRect();
+        panel.style.top = rect.bottom+"px";
+        panel.style.left = rect.left+"px";
       }
 
-      // create folder UI behavior
-      input.addEventListener("input", ()=>{
-        const ok = input.value.trim().length > 0;
-        createIcon.setAttribute("aria-disabled", ok ? "false" : "true");
-        createIcon.style.opacity = ok ? "1" : "0.5";
+      document.body.addEventListener("click", ()=>{ 
+        const old = document.querySelector(".menu-panel"); 
+        if (old) old.remove(); 
       });
 
-      function createFolder(){
-        const name = input.value.trim();
-        if(!name) return;
-        createIcon.setAttribute("aria-disabled", "true");
-        fetch("/folders/create", {
-          method:"POST", headers:{"Content-Type":"application/json"},
-          body: JSON.stringify({name})
-        }).then(async r=>{
-          if(r.ok){
-            showFeedback("Folder '"+name+"' created", "ok");
-            input.value = "";
-            loadFiles();
-          } else {
-            const j = await r.json().catch(()=>({error:"unknown"}));
-            showFeedback(j.error || "Could not create folder", "err");
-          }
-        }).finally(()=> {
-          createIcon.setAttribute("aria-disabled", "false");
-          createIcon.style.opacity = "1";
-        });
-      }
-
-      createIcon.onclick = (ev)=>{
-        if(createIcon.getAttribute("aria-disabled")==="true") return;
-        createFolder();
-      };
-
-      input.addEventListener("keydown", (ev)=>{
-        if(ev.key === "Enter"){
-          ev.preventDefault();
-          createFolder();
-        }
-      });
-
-      document.getElementById("clear").onclick = () => { logEl.textContent = ""; };
-
-      (function ensureSocketIO(){
-        if (typeof io === "undefined") {
-          const s = document.createElement("script");
-          s.src = "https://cdn.jsdelivr.net/npm/socket.io-client@4/dist/socket.io.min.js";
-          s.onload = () => { console.log("loaded socket.io client"); };
-          document.head.appendChild(s);
-        }
-      })();
-
-      loadFiles();
-      setInterval(loadFiles, 15000);
+      refresh();
     </script>
   </body>
 </html>
