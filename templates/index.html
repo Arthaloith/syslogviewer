@@ -33,17 +33,13 @@
       .file-actions{display:flex;gap:6px;align-items:center}
       .menu-btn{background:transparent;border:0;color:var(--muted);font-size:16px;cursor:pointer;padding:6px;border-radius:6px}
       #controls { padding: 10px 12px; border-bottom: 1px solid var(--border); display: flex; gap: 8px; align-items: center; background: linear-gradient(180deg,#fff, #fbfdff); }
-      #log { flex: 1; background: #0b1220; color: #e6eef8; padding: 14px; font-family: monospace; overflow: auto; }
+      #log { flex: 1; background: #0b1220; color: #e6eef8; padding: 14px; font-family: monospace; overflow: auto; white-space: pre-wrap; }
       .muted{color:var(--muted);font-size:13px}
       .menu-panel{position:absolute;background:var(--card);border:1px solid var(--border);box-shadow:0 6px 18px rgba(11,15,25,0.08);border-radius:8px;padding:6px;min-width:160px;z-index:40}
       .menu-panel button{display:block;width:100%;text-align:left;background:transparent;border:0;padding:8px;border-radius:6px;color:#0b1220}
       .menu-panel button:hover{background:#f2f7ff}
-      .feedback{font-size:13px;padding:6px 10px;border-radius:8px}
-      .success{background:#eef9f1;color:#05632a;border:1px solid #d4f5de}
-      .error{background:#fff5f5;color:#990f0f;border:1px solid #ffdede}
       .delete-btn{background: #dc2626;color: #fff;border: none;padding: 6px 12px;font-size: 13px;border-radius: 6px;cursor: pointer;box-shadow: 0 1px 2px rgba(11,15,25,0.06);transition: background 0.2s ease-in-out;}
       .delete-btn:hover{background: #b91c1c}
-      /* 🔽 Logout button */
       .logout-btn {
         background: #dc2626;
         color: #fff;
@@ -54,21 +50,54 @@
         font-weight: 500;
         transition: background 0.2s;
       }
-      .logout-btn:hover {
-        background: #b91c1c;
-      }
-      /* 🔽 Log line colors */
+      .logout-btn:hover { background: #b91c1c; }
       .log-line { white-space: pre-wrap; font-family: monospace; }
-      .log-error { color: #f87171; }   /* red */
-      .log-warn { color: #facc15; }    /* yellow */
-      .log-info { color: #60a5fa; }    /* blue */
-      .log-debug { color: #9ca3af; }   /* gray */
+      .log-error { color: #f87171; }
+      .log-warn { color: #facc15; }
+      .log-info { color: #60a5fa; }
+      .log-debug { color: #9ca3af; }
+      .highlight { background: #fef08a; color:#111; }
+      #searchBar {
+        flex: 0 0 auto;
+        padding: 8px 12px;
+        border-bottom: 1px solid var(--border);
+        display: flex;
+        gap: 8px;
+        align-items: center;
+        background: #fff;
+      }
+      #searchInput {
+        flex: 1;
+        padding: 8px 10px;
+        border: 1px solid var(--border);
+        border-radius: 8px;
+        font-size: 14px;
+      }
+      #pauseBtn {
+        background: #6b7280;
+        color: #fff;
+        padding: 6px 12px;
+        border-radius: 8px;
+        cursor: pointer;
+        border: none;
+        font-size: 13px;
+      }
+      #pauseBtn.active { background: #374151; }
+      #statsBox {
+        margin-top: 16px;
+        background: var(--card);
+        border: 1px solid var(--border);
+        border-radius: 10px;
+        padding: 12px;
+        box-shadow: 0 1px 2px rgba(16,24,40,0.03);
+      }
+      #statsBox h4 { margin: 0 0 8px; font-weight: 600; color:#0b1220; }
+      #statsBox div { font-size: 14px; margin: 4px 0; }
     </style>
   </head>
   <body>
     <div id="sidebar">
       <h3>Log files</h3>
-
       <div class="create-row">
         <div class="pill" role="group" aria-label="create folder">
           <svg width="16" height="16" viewBox="0 0 24 24" fill="none" style="opacity:0.65">
@@ -80,11 +109,18 @@
       </div>
       <div id="createFeedback" style="height:34px;margin-bottom:8px"></div>
       <div class="hint">Folders are virtual and stored next to the app as <code>.folders.json</code>. Deleting a folder won't remove files.</div>
-
       <div id="folders" style="margin-top:12px"></div>
-
       <div style="margin-top:8px;margin-bottom:6px"><strong>Unsorted</strong> <span class="muted" id="unsorted-count"></span></div>
       <div id="files"></div>
+
+      <!-- 📊 Stats Sidebar -->
+      <div id="statsBox">
+        <h4>Stats</h4>
+        <div id="stat-errors">Errors: 0</div>
+        <div id="stat-warns">Warnings: 0</div>
+        <div id="stat-info">Info: 0</div>
+        <div id="stat-debug">Debug: 0</div>
+      </div>
     </div>
 
     <div id="main">
@@ -92,8 +128,14 @@
         <div id="current" class="muted">Not connected</div>
         <div style="flex:1"></div>
         <button id="clear" class="ghost" title="Clear log view">Clear</button>
+        <button id="pauseBtn">Pause</button>
         <a href="{{ url_for('logout') }}" class="logout-btn">Logout</a>
       </div>
+
+      <div id="searchBar">
+        <input id="searchInput" type="text" placeholder="Search logs..." />
+      </div>
+
       <div id="log"></div>
     </div>
 
@@ -102,44 +144,73 @@
       const socket = io();
       let currentFile = null;
       let foldersOrder = [];
+      let autoScroll = true;
 
       const logEl = document.getElementById("log");
       const currentEl = document.getElementById("current");
+      const pauseBtn = document.getElementById("pauseBtn");
+      const searchInput = document.getElementById("searchInput");
+
+      // 📊 Stats counters
+      let stats = { errors: 0, warns: 0, info: 0, debug: 0 };
+      const statErrors = document.getElementById("stat-errors");
+      const statWarns = document.getElementById("stat-warns");
+      const statInfo = document.getElementById("stat-info");
+      const statDebug = document.getElementById("stat-debug");
+
+      function updateStatsDisplay() {
+        statErrors.textContent = `Errors: ${stats.errors}`;
+        statWarns.textContent = `Warnings: ${stats.warns}`;
+        statInfo.textContent = `Info: ${stats.info}`;
+        statDebug.textContent = `Debug: ${stats.debug}`;
+      }
 
       socket.on("log_line", (data)=>{
         if (data.file !== currentFile) return;
-
         const line = document.createElement("div");
         line.className = "log-line";
-
         const text = data.line;
 
         if (/error|fail|critical/i.test(text)) {
           line.classList.add("log-error");
+          stats.errors++;
         } else if (/warn|warning/i.test(text)) {
           line.classList.add("log-warn");
+          stats.warns++;
         } else if (/info|notice/i.test(text)) {
           line.classList.add("log-info");
+          stats.info++;
         } else if (/debug/i.test(text)) {
           line.classList.add("log-debug");
+          stats.debug++;
         }
+        updateStatsDisplay();
 
         line.textContent = text;
         logEl.appendChild(line);
-        logEl.scrollTop = logEl.scrollHeight;
+        if (autoScroll) {
+          logEl.scrollTop = logEl.scrollHeight;
+        }
       });
 
       socket.on("log_error", (data)=>{
         if (data.file !== currentFile) return;
         const line = document.createElement("div");
         line.className = "log-line log-error";
-        line.textContent = "\\n[Error: " + data.error + "]\\n";
+        line.textContent = "[Error: " + data.error + "]";
         logEl.appendChild(line);
-        logEl.scrollTop = logEl.scrollHeight;
       });
 
       document.getElementById("clear").onclick = ()=>{
         logEl.textContent = "";
+        stats = { errors: 0, warns: 0, info: 0, debug: 0 };
+        updateStatsDisplay();
+      };
+
+      pauseBtn.onclick = ()=>{
+        autoScroll = !autoScroll;
+        pauseBtn.classList.toggle("active", !autoScroll);
+        pauseBtn.textContent = autoScroll ? "Pause" : "Resume";
       };
 
       function setActive(file){
@@ -149,6 +220,8 @@
         currentFile = file;
         currentEl.textContent = file;
         logEl.textContent = "";
+        stats = { errors: 0, warns: 0, info: 0, debug: 0 };
+        updateStatsDisplay();
         socket.emit("join", {file});
       }
 
@@ -209,7 +282,6 @@
         const actions = document.createElement("div");
         actions.className = "file-actions";
 
-        // ⬇️ Download button
         const dlBtn = document.createElement("a");
         dlBtn.href = `/logs/download/${encodeURIComponent(f)}`;
         dlBtn.textContent = "⬇️";
@@ -221,7 +293,6 @@
         dlBtn.style.color = "#111";
         actions.appendChild(dlBtn);
 
-        // ⋯ Move menu button
         const menuBtn = document.createElement("button");
         menuBtn.className = "menu-btn";
         menuBtn.innerHTML = "⋯";
@@ -267,6 +338,19 @@
       document.body.addEventListener("click", ()=>{ 
         const old = document.querySelector(".menu-panel"); 
         if (old) old.remove(); 
+      });
+
+      // 🔍 Search functionality
+      searchInput.addEventListener("input", ()=>{
+        const term = searchInput.value.trim();
+        const lines = logEl.querySelectorAll(".log-line");
+        lines.forEach(line=>{
+          line.innerHTML = line.textContent;
+          if (term && line.textContent.toLowerCase().includes(term.toLowerCase())) {
+            const regex = new RegExp(`(${term})`, "gi");
+            line.innerHTML = line.textContent.replace(regex, `<span class="highlight">$1</span>`);
+          }
+        });
       });
 
       refresh();
